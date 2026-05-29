@@ -6,12 +6,13 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,13 +34,14 @@ type ipLimiter struct {
 }
 
 type Auth struct {
-	db       map[string]string
-	Jobs     chan *AuthJob
-	limiters sync.Map
-	nonceMu  sync.Mutex
-	nonces   map[string]time.Time
-	stopCh   chan struct{}
-	stopOnce sync.Once
+	db           map[string]string
+	Jobs         chan *AuthJob
+	limiters     sync.Map
+	nonceMu      sync.Mutex
+	nonces       map[string]time.Time
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	limiterCount int64
 }
 
 const (
@@ -53,7 +55,8 @@ const (
 	limiterSweepEvery  = 5 * time.Minute
 	nonceTTL           = 1 * time.Minute
 	nonceSweepEvery    = 1 * time.Minute
-	allowedTimeSkew    = 30 * time.Second
+	maxNonces          = 100000
+	maxLimiterEntries  = 100000
 )
 
 var (
@@ -279,18 +282,13 @@ func clientIP(r *http.Request) string {
 
 func (a *Auth) allowRequest(ip string) bool {
 
+	lim, ok := a.getLimiter(ip)
+	if !ok {
+		logJSON("warn", "limiter_capacity_reached", logFields{"ip": ip})
+		return false
+	}
+
 	now := time.Now()
-
-	limIface, _ := a.limiters.LoadOrStore(
-		ip,
-		&ipLimiter{
-			tokens:   burstTokens,
-			last:     now,
-			lastSeen: now,
-		},
-	)
-
-	lim := limIface.(*ipLimiter)
 
 	lim.mu.Lock()
 	defer lim.mu.Unlock()
@@ -317,16 +315,10 @@ func (a *Auth) allowRequest(ip string) bool {
 
 func (a *Auth) recordFailure(ip string) time.Duration {
 
-	limIface, _ := a.limiters.LoadOrStore(
-		ip,
-		&ipLimiter{
-			tokens:   burstTokens,
-			last:     time.Now(),
-			lastSeen: time.Now(),
-		},
-	)
-
-	lim := limIface.(*ipLimiter)
+	lim, ok := a.getLimiter(ip)
+	if !ok {
+		return maxFailDelay
+	}
 
 	lim.mu.Lock()
 	defer lim.mu.Unlock()
@@ -398,6 +390,7 @@ func (a *Auth) StartLimiterCleanup() {
 					if stale {
 
 						a.limiters.Delete(key)
+						atomic.AddInt64(&a.limiterCount, -1)
 
 						removed++
 					}
@@ -481,6 +474,10 @@ func (a *Auth) checkAndStoreNonce(
 	a.nonceMu.Lock()
 	defer a.nonceMu.Unlock()
 
+	if len(a.nonces) >= maxNonces {
+		return false
+	}
+
 	if t, exists := a.nonces[key]; exists &&
 		t.After(cutoff) {
 
@@ -527,31 +524,6 @@ func decodeHexSignature(sig string) ([]byte, error) {
 	return hex.DecodeString(sig)
 }
 
-func isValidNonce(nonce string) bool {
-
-	if len(nonce) < 8 ||
-		len(nonce) > 64 {
-
-		return false
-	}
-
-	for _, r := range nonce {
-
-		if (r >= 'a' && r <= 'z') ||
-			(r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') ||
-			r == '-' ||
-			r == '_' {
-
-			continue
-		}
-
-		return false
-	}
-
-	return true
-}
-
 func (a *Auth) ServeHTTP(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -596,91 +568,37 @@ func (a *Auth) ServeHTTP(
 		return
 	}
 
-	r.Body = http.MaxBytesReader(
-		w,
-		r.Body,
-		maxBodyBytes,
-	)
-
-	if err := r.ParseForm(); err != nil {
-
-		logJSON(
-			"warn",
-			"request_too_large",
-			logFields{
-				"ip":  ip,
-				"err": err.Error(),
-			},
-		)
-
-		http.Error(
-			w,
-			"Request too large",
-			http.StatusRequestEntityTooLarge,
-		)
-
-		return
-	}
-
-	u := r.PostFormValue("username")
-	p := r.PostFormValue("password")
-	c := r.PostFormValue("pubkey")
-	tsStr := r.PostFormValue("timestamp")
-	nonce := r.PostFormValue("nonce")
-	signature := r.PostFormValue("signature")
-
-	if signature == "" {
-
-		http.Error(
-			w,
-			"Authentication failed",
-			http.StatusUnauthorized,
-		)
-
-		return
-	}
-
-	if !isValidNonce(nonce) {
-
-		http.Error(
-			w,
-			"Authentication failed",
-			http.StatusUnauthorized,
-		)
-
-		return
-	}
-
-	ts, err := strconv.ParseInt(
-		tsStr,
-		10,
-		64,
-	)
-
+	now := time.Now()
+	req, err := ParseAuthRequest(w, r, now)
 	if err != nil {
-
-		http.Error(
-			w,
-			"Authentication failed",
-			http.StatusUnauthorized,
-		)
-
+		fields := logFields{"ip": ip, "err": err.Error()}
+		var vErr *ValidationError
+		if errors.As(err, &vErr) {
+			fields["field"] = vErr.Field
+			fields["code"] = vErr.Code
+		}
+		logJSON("warn", "auth_params_invalid", fields)
+		status := http.StatusUnauthorized
+		msg := "Authentication failed"
+		if vErr != nil && vErr.Status != 0 {
+			status = vErr.Status
+			switch status {
+			case http.StatusRequestEntityTooLarge:
+				msg = "Request too large"
+			case http.StatusBadRequest:
+				msg = "Invalid request"
+			}
+		}
+		http.Error(w, msg, status)
 		return
 	}
 
-	if delta := time.Since(
-		time.Unix(ts, 0),
-	); delta > allowedTimeSkew ||
-		delta < -allowedTimeSkew {
-
-		http.Error(
-			w,
-			"Authentication failed",
-			http.StatusUnauthorized,
-		)
-
-		return
-	}
+	u := req.Username
+	p := req.Password
+	c := req.PubKey
+	tsStr := req.TimestampRaw
+	nonce := req.Nonce
+	signature := req.Signature
 
 	ok := false
 
@@ -719,8 +637,6 @@ func (a *Auth) ServeHTTP(
 					expected,
 					provided,
 				) {
-
-					now := time.Now()
 
 					if a.checkAndStoreNonce(
 						u,
@@ -836,4 +752,23 @@ func (a *Auth) ServeHTTP(
 			http.StatusGatewayTimeout,
 		)
 	}
+}
+
+func (a *Auth) getLimiter(ip string) (*ipLimiter, bool) {
+	limIface, loaded := a.limiters.LoadOrStore(
+		ip,
+		&ipLimiter{
+			tokens:   burstTokens,
+			last:     time.Now(),
+			lastSeen: time.Now(),
+		},
+	)
+	if !loaded {
+		if atomic.AddInt64(&a.limiterCount, 1) > maxLimiterEntries {
+			a.limiters.Delete(ip)
+			atomic.AddInt64(&a.limiterCount, -1)
+			return nil, false
+		}
+	}
+	return limIface.(*ipLimiter), true
 }

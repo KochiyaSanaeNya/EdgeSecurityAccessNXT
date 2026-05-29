@@ -103,10 +103,6 @@ func main() {
 
 	log.SetFlags(0)
 
-	// ====================================
-	// auth init
-	// ====================================
-
 	auth, err := New("config/users.txt")
 
 	if err != nil {
@@ -124,10 +120,6 @@ func main() {
 
 	auth.StartLimiterCleanup()
 	auth.StartNonceCleanup()
-
-	// ====================================
-	// user store
-	// ====================================
 
 	store, err := LoadUserStore(
 		"config/usrwg.conf",
@@ -148,10 +140,6 @@ func main() {
 
 	userStore = store
 
-	// ====================================
-	// config
-	// ====================================
-
 	cfg := esacfg()
 
 	if cfg == nil {
@@ -164,10 +152,6 @@ func main() {
 
 		return
 	}
-
-	// ====================================
-	// http server
-	// ====================================
 
 	server := &http.Server{
 		Addr: cfg.IPPort,
@@ -197,20 +181,12 @@ func main() {
 		},
 	)
 
-	// ====================================
-	// start server
-	// ====================================
-
 	srvErrCh := make(chan error, 1)
 
 	safeGo(func() {
 
 		srvErrCh <- server.ListenAndServe()
 	})
-
-	// ====================================
-	// workers
-	// ====================================
 
 	workerCount := 8
 
@@ -254,10 +230,6 @@ func main() {
 		default:
 		}
 
-		// ====================================
-		// user lookup
-		// ====================================
-
 		usercfg := userStore.Get(
 			job.username,
 		)
@@ -280,10 +252,6 @@ func main() {
 
 			return
 		}
-
-		// ====================================
-		// generate config
-		// ====================================
 
 		tmpl := "$usrip\n$servpub\n$subnet\n$endpoint\n$keeptime"
 
@@ -313,10 +281,6 @@ func main() {
 				}
 			},
 		)
-
-		// ====================================
-		// wg update
-		// ====================================
 
 		var upconfig upconf
 
@@ -361,10 +325,6 @@ func main() {
 			return
 		}
 
-		// ====================================
-		// success
-		// ====================================
-
 		logJSON(
 			"info",
 			"wg_update_ok",
@@ -390,10 +350,6 @@ func main() {
 			}
 		})
 	}
-
-	// ====================================
-	// signal handling
-	// ====================================
 
 	sigCh := make(chan os.Signal, 1)
 
@@ -432,10 +388,6 @@ func main() {
 			nil,
 		)
 	}
-
-	// ====================================
-	// shutdown
-	// ====================================
 
 	shutdownCtx, cancel := context.WithTimeout(
 		context.Background(),

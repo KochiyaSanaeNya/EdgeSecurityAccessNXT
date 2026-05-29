@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
 	"os/exec"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -20,13 +18,9 @@ type upconf struct {
 	status     bool // true = add to tail  | false = find and delete Peer block
 }
 
-var wgPubKeyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{43}=$`)
-
 const (
-	wgSaveDebounce   = 1 * time.Second
-	wgSaveTimeout    = 5 * time.Second
-	minIPv4MaskBits  = 24
-	minIPv6MaskBits  = 64
+	wgSaveDebounce = 1 * time.Second
+	wgSaveTimeout  = 5 * time.Second
 )
 
 var (
@@ -136,44 +130,6 @@ func scheduleWGPersist(iface string, confPath string) {
 	}
 }
 
-func validAllowedIP(value string) bool {
-	if _, _, err := net.ParseCIDR(value); err == nil {
-		return true
-	}
-	return net.ParseIP(value) != nil
-}
-
-func validateAllowedIP(value string) bool {
-	if ip := net.ParseIP(value); ip != nil {
-		return true
-	}
-	_, n, err := net.ParseCIDR(value)
-	if err != nil || n == nil {
-		return false
-	}
-	ones, bits := n.Mask.Size()
-	if bits == 32 {
-		return ones >= minIPv4MaskBits
-	}
-	if bits == 128 {
-		return ones >= minIPv6MaskBits
-	}
-	return false
-}
-
-func validatePeer(conf *upconf) error {
-	if conf.userpublic == "" {
-		return fmt.Errorf("empty public key")
-	}
-	if !wgPubKeyRe.MatchString(conf.userpublic) {
-		return fmt.Errorf("invalid public key")
-	}
-	if conf.userip == "" || !validAllowedIP(conf.userip) || !validateAllowedIP(conf.userip) {
-		return fmt.Errorf("invalid allowed IP")
-	}
-	return nil
-}
-
 func persistWG(ctx context.Context, iface string, confPath string) error {
 	if strings.TrimSpace(confPath) == "" {
 		return nil
@@ -197,7 +153,7 @@ func persistWG(ctx context.Context, iface string, confPath string) error {
 }
 
 func updatewg(ctx context.Context, conf *upconf, iface string) error {
-	if err := validatePeer(conf); err != nil {
+	if err := ValidatePeer(conf); err != nil {
 		logJSON("warn", "peer_validation_failed", logFields{
 			"user":        conf.username,
 			"ip":          conf.userip,
